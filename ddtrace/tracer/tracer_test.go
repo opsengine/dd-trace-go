@@ -1655,11 +1655,21 @@ func TestTracerConcurrentMultipleSpans(t *testing.T) {
 	}()
 
 	wg.Wait()
-	flush(2)
+	// 2 goroutines × 2 spans each = 4 individual span submissions.
+	flush(4)
 	traces := transport.Traces()
-	assert.Len(traces, 2)
-	assert.Len(traces[0], 2)
-	assert.Len(traces[1], 2)
+	assert.Len(traces, 4)
+	// Group by trace ID to verify structure.
+	grouped := make(map[uint64][]*Span)
+	for _, group := range traces {
+		for _, sp := range group {
+			grouped[sp.traceID] = append(grouped[sp.traceID], sp)
+		}
+	}
+	assert.Len(grouped, 2, "should have 2 distinct traces")
+	for _, spans := range grouped {
+		assert.Len(spans, 2, "each trace should have 2 spans")
+	}
 }
 
 func TestTracerAtomicFlush(t *testing.T) {
@@ -1669,7 +1679,8 @@ func TestTracerAtomicFlush(t *testing.T) {
 		assert.Nil(err)
 		defer stop()
 
-		// Make sure we don't flush partial bits of traces
+		// In the send-on-finish model each span is submitted immediately when
+		// it finishes; the root not being done does not hold back other spans.
 		root := tracer.newRootSpan("pylons.request", "pylons", "/")
 		span := tracer.newChildSpan("redis.command", root)
 		span1 := tracer.newChildSpan("redis.command.1", span)
@@ -1678,17 +1689,17 @@ func TestTracerAtomicFlush(t *testing.T) {
 		span1.Finish()
 		span2.Finish()
 
-		flush(-1)
-		synctest.Wait() // wait for writer to process tick and find no complete trace
+		flush(3)
+		synctest.Wait()
 		traces := transport.Traces()
-		assert.Len(traces, 0, "nothing should be flushed now as span2 is not finished yet")
+		assert.Len(traces, 3, "3 child spans should have been flushed individually")
 
 		root.Finish()
 
 		flush(1)
 		traces = transport.Traces()
 		assert.Len(traces, 1)
-		assert.Len(traces[0], 4, "all spans should show up at once")
+		assert.Equal("pylons.request", traces[0][0].name)
 	})
 }
 
@@ -1806,10 +1817,19 @@ func TestTracerRace(t *testing.T) {
 
 	wg.Wait()
 
-	flush(total)
-	traces := transport.Traces()
-	assert.Len(traces, total, "we should have exactly as many traces as expected")
-	for _, trace := range traces {
+	// In the send-on-finish model each span is submitted individually, so we
+	// expect total*3 single-span groups rather than total 3-span groups.
+	flush(total * 3)
+	rawTraces := transport.Traces()
+	// Group spans by trace ID to recover the logical trace grouping.
+	grouped := make(map[uint64][]*Span)
+	for _, traceGroup := range rawTraces {
+		for _, span := range traceGroup {
+			grouped[span.traceID] = append(grouped[span.traceID], span)
+		}
+	}
+	assert.Len(grouped, total, "we should have exactly as many traces as expected")
+	for _, trace := range grouped {
 		assert.Len(trace, 3, "each trace should have exactly 3 spans")
 		var parent, child, redis *Span
 		for _, span := range trace {
@@ -1871,11 +1891,11 @@ func TestPushPayload(t *testing.T) {
 	s := newBasicSpan("3MB")
 	s.meta.Set("key", strings.Repeat("X", payloadSizeLimit/2+10))
 	// half payload size reached
-	tracer.pushChunk(&chunk{[]*Span{s}, true})
+	tracer.pushChunk(&chunk{spans: []*Span{s}, willSend: true})
 	tracer.awaitPayload(t, 1)
 
 	// payload size exceeded
-	tracer.pushChunk(&chunk{[]*Span{s}, true})
+	tracer.pushChunk(&chunk{spans: []*Span{s}, willSend: true})
 	flush(2)
 }
 
@@ -1931,12 +1951,18 @@ func TestTracerFlush(t *testing.T) {
 		root := tracer.StartSpan("root")
 		tracer.StartSpan("child.direct", ChildOf(root.Context())).Finish()
 		root.Finish()
-		flush(1)
+		// In the send-on-finish model each span is its own group.
+		flush(2)
 
 		list := transport.Traces()
-		assert.Len(list, 1)
-		assert.Len(list[0], 2)
-		assert.Equal("child.direct", list[0][1].name)
+		assert.Len(list, 2)
+		names := make(map[string]bool)
+		for _, group := range list {
+			assert.Len(group, 1)
+			names[group[0].name] = true
+		}
+		assert.True(names["child.direct"])
+		assert.True(names["root"])
 	})
 
 	t.Run("extracted", func(t *testing.T) {

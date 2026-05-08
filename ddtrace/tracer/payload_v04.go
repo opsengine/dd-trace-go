@@ -11,9 +11,8 @@ import (
 	"io"
 	"sync/atomic"
 
-	"github.com/tinylib/msgp/msgp"
-
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
+	"github.com/tinylib/msgp/msgp"
 )
 
 // payloadV04 is a wrapper on top of the msgpack encoder which allows constructing an
@@ -84,7 +83,7 @@ func (p *payloadV04) push(t spanList) (stats payloadStats, err error) {
 }
 
 func (p *payloadV04) setTracerTags(t spanList) {
-	// set on first chunk
+	// set on first chunk only
 	if atomic.LoadUint32(&p.count) != 0 {
 		return
 	}

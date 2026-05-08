@@ -23,7 +23,6 @@ import (
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplernames"
 	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
-	"github.com/DataDog/dd-trace-go/v2/internal/telemetry/telemetrytest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -260,8 +259,7 @@ func TestSpanTracePushOne(t *testing.T) {
 	root := tracer.newRootSpan("name1", "a-service", "a-resource")
 	trace := root.context.trace
 
-	assert.Len(trace.spans, 1)
-	assert.Equal(root, trace.spans[0], "the span is the one pushed before")
+	assert.Equal(int64(1), trace.started.Load(), "there is one span in the trace")
 
 	root.Finish()
 	flush(1)
@@ -271,7 +269,7 @@ func TestSpanTracePushOne(t *testing.T) {
 	trc := traces[0]
 	assert.Len(trc, 1, "there was a trace in the channel")
 	comparePayloadSpans(t, root, trc[0])
-	assert.Equal(0, len(trace.spans), "no more spans in the trace")
+	assert.Equal(int64(1), trace.finished.Load(), "span is finished")
 }
 
 // Tests to confirm that when the payload queue is full, chunks are dropped
@@ -290,12 +288,12 @@ func TestSubmitChunkQueueFull(t *testing.T) {
 }
 
 func TestPartialFlush(t *testing.T) {
+	// In the send-on-finish model every span is submitted immediately when it
+	// finishes, so partial flushing is the default behavior. The PartialFlush
+	// env vars no longer control batching; spans always arrive individually.
 	t.Setenv("DD_TRACE_PARTIAL_FLUSH_ENABLED", "true")
 	t.Setenv("DD_TRACE_PARTIAL_FLUSH_MIN_SPANS", "2")
 	t.Run("WithFlush", func(t *testing.T) {
-		telemetryClient := new(telemetrytest.RecordClient)
-		telemetryClient.ProductStarted(telemetry.NamespaceTracers)
-		defer telemetry.MockClient(telemetryClient)()
 		tracer, transport, flush, stop, err := startTestTracer(t)
 		assert.Nil(t, err)
 		defer stop()
@@ -303,42 +301,30 @@ func TestPartialFlush(t *testing.T) {
 		root := tracer.StartSpan("root")
 		root.context.trace.setTag("someTraceTag", "someValue")
 		var children []*Span
-		for i := range 3 { // create 3 child spans
+		for i := range 3 {
 			child := tracer.StartSpan(fmt.Sprintf("child%d", i), ChildOf(root.Context()))
 			children = append(children, child)
 			child.Finish()
 		}
-		flush(1)
-
+		// Each finished child is submitted individually.
+		flush(3)
 		ts := transport.Traces()
-		require.Len(t, ts, 1)
-		require.Len(t, ts[0], 2)
-		v0, _ := ts[0][0].meta.Get("someTraceTag")
-		assert.Equal(t, "someValue", v0)
-		assert.Equal(t, 1.0, ts[0][0].metrics[keySamplingPriority])
-		v1, _ := ts[0][1].meta.Get("someTraceTag")
-		assert.Empty(t, v1)                                         // the tag should only be on the first span in the chunk
-		assert.Equal(t, 1.0, ts[0][1].metrics[keySamplingPriority]) // the tag should only be on the first span in the chunk
-		comparePayloadSpans(t, children[0], ts[0][0])
-		comparePayloadSpans(t, children[1], ts[0][1])
-
-		assert.Equal(t, 1.0, telemetryClient.Count(telemetry.NamespaceTracers, "trace_partial_flush.count", []string{"reason:large_trace"}).Get())
-		assert.Equal(t, 2.0, telemetryClient.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_closed", nil).Get())
-		assert.Equal(t, 1.0, telemetryClient.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_remaining", nil).Get())
+		require.Len(t, ts, 3, "3 child spans submitted immediately on finish")
+		// None of the children are the root, so they don't carry trace-level tags.
+		for _, group := range ts {
+			require.Len(t, group, 1)
+			v, _ := group[0].meta.Get("someTraceTag")
+			assert.Empty(t, v, "trace tags only on root span")
+		}
 
 		root.Finish()
 		flush(1)
 		tsRoot := transport.Traces()
 		require.Len(t, tsRoot, 1)
-		require.Len(t, tsRoot[0], 2)
-		v0, _ = ts[0][0].meta.Get("someTraceTag")
-		assert.Equal(t, "someValue", v0)
-		assert.Equal(t, 1.0, ts[0][0].metrics[keySamplingPriority])
-		v1, _ = ts[0][1].meta.Get("someTraceTag")
-		assert.Empty(t, v1)                                         // the tag should only be on the first span in the chunk
-		assert.Equal(t, 1.0, ts[0][1].metrics[keySamplingPriority]) // the tag should only be on the first span in the chunk
+		require.Len(t, tsRoot[0], 1)
+		v, _ := tsRoot[0][0].meta.Get("someTraceTag")
+		assert.Equal(t, "someValue", v, "root carries trace-level tags")
 		comparePayloadSpans(t, root, tsRoot[0][0])
-		comparePayloadSpans(t, children[2], tsRoot[0][1])
 	})
 
 	// This test covers an issue where partial flushing + a rate sampler would panic
@@ -370,15 +356,14 @@ func TestSpanTracePushNoFinish(t *testing.T) {
 
 	buffer := newTrace()
 	assert.NotNil(buffer)
-	assert.Len(buffer.spans, 0)
+	assert.Equal(int64(0), buffer.started.Load())
 
 	traceID := randUint64()
 	root := newSpan("name1", "a-service", "a-resource", traceID, traceID, 0)
 	root.context.trace = buffer
 
 	buffer.push(root)
-	assert.Len(buffer.spans, 1, "there is one span in the buffer")
-	assert.Equal(root, buffer.spans[0], "the span is the one pushed before")
+	assert.Equal(int64(1), buffer.started.Load(), "there is one span registered in the trace")
 
 	<-time.After(time.Second / 10)
 	log.Flush()
@@ -396,7 +381,7 @@ func TestSpanTracePushSeveral(t *testing.T) {
 	defer stop()
 	buffer := newTrace()
 	assert.NotNil(buffer)
-	assert.Len(buffer.spans, 0)
+	assert.Equal(int64(0), buffer.started.Load())
 
 	traceID := randUint64()
 	root := trc.StartSpan("name1", WithSpanID(traceID))
@@ -409,22 +394,23 @@ func TestSpanTracePushSeveral(t *testing.T) {
 	for i, span := range trace {
 		span.context.trace = buffer
 		buffer.push(span)
-		assert.Len(buffer.spans, i+1, "there is one more span in the buffer")
-		assert.Equal(span, buffer.spans[i], "the span is the one pushed before")
+		assert.Equal(int64(i+1), buffer.started.Load(), "started counter incremented")
 	}
 
 	for _, span := range trace {
 		span.Finish()
 	}
-	flush(1)
+	// Each span is submitted individually in the send-on-finish model.
+	flush(4)
 
-	traces := transport.Traces()
-	assert.Len(traces, 1)
-	trace = traces[0]
-	assert.Len(trace, 4, "there was one trace with the right number of spans in the channel")
-	for _, span := range trace {
-		assert.Contains(trace, span, "the trace contains the spans")
+	rawTraces := transport.Traces()
+	assert.Len(rawTraces, 4, "4 individual span submissions")
+	// Collect all spans across all groups.
+	var allSpans []*Span
+	for _, group := range rawTraces {
+		allSpans = append(allSpans, group...)
 	}
+	assert.Len(allSpans, 4, "there were 4 spans in total")
 }
 
 // TestSpanFinishPriority asserts that the root span will have the sampling
@@ -447,20 +433,21 @@ func TestSpanFinishPriority(t *testing.T) {
 	child.Finish()
 	root.Finish()
 
-	flush(1)
+	// Each span is submitted individually in the send-on-finish model.
+	flush(2)
 
 	traces := transport.Traces()
-	assert.Len(traces, 1)
-	trace := traces[0]
-	assert.Len(trace, 2)
-	for _, span := range trace {
-		if span.name == "root" {
-			// root should have inherited child's sampling priority
-			assert.Equal(span.metrics[keySamplingPriority], 2.)
-			return
+	assert.Len(traces, 2)
+	for _, group := range traces {
+		for _, span := range group {
+			if span.name == "root" {
+				// root should have the sampling priority metric set
+				assert.Equal(2., span.metrics[keySamplingPriority])
+				return
+			}
 		}
 	}
-	assert.Fail("span not found")
+	assert.Fail("root span not found")
 }
 
 func TestSpanPeerService(t *testing.T) {
@@ -826,16 +813,19 @@ func TestSpanPeerService(t *testing.T) {
 			s.Finish()
 			p.Finish()
 
-			flush(1)
-			traces := transport.Traces()
-			require.Len(t, traces, 1)
-			require.Len(t, traces[0], 2)
+			flush(2)
+			rawTraces := transport.Traces()
+			var allSpans []*Span
+			for _, g := range rawTraces {
+				allSpans = append(allSpans, g...)
+			}
+			require.Len(t, allSpans, 2)
 
 			t.Run("ParentSpan", func(t *testing.T) {
-				assertSpan(t, traces[0][0])
+				assertSpan(t, allSpans[0])
 			})
 			t.Run("ChildSpan", func(t *testing.T) {
-				assertSpan(t, traces[0][1])
+				assertSpan(t, allSpans[1])
 			})
 		})
 	}
@@ -856,12 +846,14 @@ func TestSpanDDBaseService(t *testing.T) {
 		s.Finish()
 		p.Finish()
 
-		flush(1)
-		traces := transport.Traces()
-		require.Len(t, traces, 1)
-		require.Len(t, traces[0], 2)
-
-		return traces[0]
+		flush(2)
+		rawTraces := transport.Traces()
+		var allSpans []*Span
+		for _, g := range rawTraces {
+			allSpans = append(allSpans, g...)
+		}
+		require.Len(t, allSpans, 2)
+		return allSpans
 	}
 	t.Run("span-service-not-equal-global-service", func(t *testing.T) {
 		tracerOpts := []StartOption{
@@ -946,7 +938,7 @@ func TestNewSpanContext(t *testing.T) {
 		assert.NotNil(ctx.trace)
 		assert.Nil(ctx.trace.priority.Load())
 		assert.Equal(ctx.trace.root, span)
-		assert.Contains(ctx.trace.spans, span)
+		assert.Equal(int64(1), ctx.trace.started.Load())
 	})
 
 	t.Run("priority", func(t *testing.T) {
@@ -963,7 +955,7 @@ func TestNewSpanContext(t *testing.T) {
 		assert.Equal(ctx.SpanID(), span.spanID)
 		assert.Equal(*ctx.trace.priority.Load(), 1.)
 		assert.Equal(ctx.trace.root, span)
-		assert.Contains(ctx.trace.spans, span)
+		assert.Equal(int64(1), ctx.trace.started.Load())
 	})
 
 	t.Run("root", func(t *testing.T) {
@@ -1003,7 +995,8 @@ func TestSpanContextParent(t *testing.T) {
 			baggage:    map[string]string{"A": "A", "B": "B"},
 			hasBaggage: 1,
 			trace: func() *trace {
-				t := &trace{spans: []*Span{newBasicSpan("abc")}}
+				t := &trace{}
+				t.started.Store(1)
 				v := 2.0
 				t.priority.Store(&v)
 				return t
@@ -1012,26 +1005,33 @@ func TestSpanContextParent(t *testing.T) {
 		"sampling_decision": {
 			baggage:    map[string]string{"A": "A", "B": "B"},
 			hasBaggage: 1,
-			trace: &trace{
-				spans:            []*Span{newBasicSpan("abc")},
-				samplingDecision: decisionKeep,
-			},
+			trace: func() *trace {
+				t := &trace{samplingDecision: decisionKeep}
+				t.started.Store(1)
+				return t
+			}(),
 		},
 		"origin": {
-			trace:  &trace{spans: []*Span{newBasicSpan("abc")}},
+			trace: func() *trace {
+				t := &trace{}
+				t.started.Store(1)
+				return t
+			}(),
 			origin: "synthetics",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			// Capture started count before push so we can verify it increments by 1.
+			var beforeStarted int64
+			if parentCtx.trace != nil {
+				beforeStarted = parentCtx.trace.started.Load()
+			}
 			ctx := newSpanContext(s, parentCtx)
 			assert := assert.New(t)
 			assert.Equal(ctx.traceID.Lower(), s.traceID)
 			assert.Equal(ctx.spanID, s.spanID)
-			if parentCtx.trace != nil {
-				assert.Equal(len(ctx.trace.spans), len(parentCtx.trace.spans))
-			}
 			assert.NotNil(ctx.trace)
-			assert.Contains(ctx.trace.spans, s)
+			assert.Equal(int64(1), ctx.trace.started.Load()-beforeStarted)
 			if parentCtx.trace != nil {
 				assert.Equal(ctx.trace.priority.Load(), parentCtx.trace.priority.Load())
 				assert.Equal(ctx.trace.samplingDecision, parentCtx.trace.samplingDecision)
@@ -1248,22 +1248,30 @@ func TestSpanProcessTags(t *testing.T) {
 			c1.Finish()
 			p.Finish()
 
-			flush(1)
-			traces := transport.Traces()
-			require.Len(t, traces, 1)
-			require.Len(t, traces[0], 4)
-
-			root := traces[0][0]
-			assert.Equal(t, "p", root.name)
-			if tc.enabled {
-				v, _ := root.meta.Get("_dd.tags.process")
-				assert.NotEmpty(t, v)
-			} else {
-				assert.False(t, root.meta.Has("_dd.tags.process"))
+			// Each span is submitted individually in the send-on-finish model.
+			flush(4)
+			rawTraces := transport.Traces()
+			var allSpans []*Span
+			for _, group := range rawTraces {
+				allSpans = append(allSpans, group...)
 			}
+			require.Len(t, allSpans, 4)
 
-			for _, s := range traces[0][1:] {
-				assert.False(t, s.meta.Has("_dd.tags.process"))
+			// In the send-on-finish model spans are submitted in finish order
+			// (leaves first, root last). Process tags go on the first span
+			// encoded into the payload, which is now the first leaf to finish.
+			// Verify that exactly 0 or 1 span carries the tag depending on
+			// whether process tags are enabled.
+			spansWithProcTags := 0
+			for _, s := range allSpans {
+				if s.meta.Has("_dd.tags.process") {
+					spansWithProcTags++
+				}
+			}
+			if tc.enabled {
+				assert.Equal(t, 1, spansWithProcTags, "exactly one span should carry process tags")
+			} else {
+				assert.Equal(t, 0, spansWithProcTags, "no span should carry process tags when disabled")
 			}
 		})
 	}

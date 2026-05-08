@@ -754,6 +754,7 @@ func (t *tracer) worker(tick <-chan time.Time) {
 type chunk struct {
 	spans    []*Span
 	willSend bool // willSend indicates whether the trace will be sent to the agent.
+	isRoot   bool // isRoot is true when this chunk contains the root span of the trace.
 }
 
 // sampleChunk applies single-span sampling to the provided trace.
@@ -779,8 +780,25 @@ func (t *tracer) sampleChunk(c *chunk) {
 	}
 	tracerstats.Signal(tracerstats.DroppedP0Spans, uint32(len(c.spans)-len(kept)))
 	if !c.willSend {
-		if len(kept) == 0 {
-			tracerstats.Signal(tracerstats.DroppedP0Traces, 1)
+		if len(kept) > 0 && len(c.spans) > 0 {
+			// Single-span sampling rescued at least one span from this dropped
+			// trace. Mark the trace so DroppedP0Traces is not counted for it.
+			if ctx := c.spans[0].context; ctx != nil && ctx.trace != nil {
+				ctx.trace.rescued.Store(true)
+			}
+		}
+		// DroppedP0Traces is counted once per trace at root-span time, but only
+		// when nothing from the trace was rescued by single-span sampling.
+		if c.isRoot && len(kept) == 0 {
+			var traceRescued bool
+			if len(c.spans) > 0 {
+				if ctx := c.spans[0].context; ctx != nil && ctx.trace != nil {
+					traceRescued = ctx.trace.rescued.Load()
+				}
+			}
+			if !traceRescued {
+				tracerstats.Signal(tracerstats.DroppedP0Traces, 1)
+			}
 		}
 		c.spans = kept
 	}

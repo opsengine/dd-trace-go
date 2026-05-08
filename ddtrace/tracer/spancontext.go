@@ -24,7 +24,6 @@ import (
 	"github.com/DataDog/dd-trace-go/v2/internal/locking/assert"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
 	"github.com/DataDog/dd-trace-go/v2/internal/samplernames"
-	"github.com/DataDog/dd-trace-go/v2/internal/telemetry"
 )
 
 const TraceIDZero string = "00000000000000000000000000000000"
@@ -482,23 +481,31 @@ const (
 // priority, the root reference and a buffer of the spans which are part of the
 // trace, if these exist.
 type trace struct {
-	// guards below fields
+	// started counts spans pushed into this trace via push(); finished counts
+	// spans that have called finishedOneLocked(). When finished == started the
+	// trace is complete. Both are updated atomically; no lock required.
+	started  atomic.Int64 // +checkatomic
+	finished atomic.Int64 // +checkatomic
+
+	// dropped is set when started exceeds traceMaxSize. Subsequent push() and
+	// finishedOneLocked() calls are no-ops.
+	dropped atomic.Bool // +checkatomic
+
+	// rescued is set when at least one span from this trace was rescued by
+	// single-span sampling even though the trace decision was drop. Used to
+	// correctly count DroppedP0Traces only when truly nothing was sent.
+	rescued atomic.Bool // +checkatomic
+
+	// mu guards metadata: tags, propagatingTags, priority, locked, dm.
+	// It is no longer held during the span-creation hot path (push) or
+	// the common span-finish path (finishedOneLocked).
 	mu locking.RWMutex
-	// all the spans that are part of this trace
-	// +checklocks:mu
-	spans []*Span
 	// trace level tags
 	// +checklocks:mu
 	tags map[string]string
 	// trace level tags that will be propagated across service boundaries
 	// +checklocks:mu
 	propagatingTags map[string]string
-	// the number of finished spans
-	// +checklocks:mu
-	finished int
-	// signifies that the span buffer is full
-	// +checklocks:mu
-	full bool
 	// sampling priority — accessed atomically to allow lock-free reads
 	// from the span creation hot path (SamplingPriority).
 	// Writes still happen under mu (because they also touch propagatingTags).
@@ -560,10 +567,9 @@ func samplingPriorityPtr(p int) *float64 {
 	return &v
 }
 
-// newTrace creates a new trace using the given callback which will be called
-// upon completion of the trace.
+// newTrace creates a new trace.
 func newTrace() *trace {
-	return &trace{spans: make([]*Span, 0, traceStartSize)}
+	return &trace{}
 }
 
 // samplingPriority returns the sampling priority of the trace, if set.
@@ -672,37 +678,31 @@ func (t *trace) setLocked(locked bool) {
 	t.locked = locked
 }
 
-// push pushes a new span into the trace. If the buffer is full, it returns
-// a errBufferFull error.
-// +checklocksignore — Reads sp.metrics during initialization; span not yet shared.
+// push registers a new span with the trace.
+// +checklocksignore — sp.metrics is read before the span is shared.
 func (t *trace) push(sp *Span) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.full {
+	if t.dropped.Load() {
 		return
 	}
-	tr := getGlobalTracer()
-	if len(t.spans) >= traceMaxSize {
-		// capacity is reached, we will not be able to complete this trace.
-		t.full = true
-		t.spans = nil // allow our spans to be collected by GC.
-		log.Error("trace buffer full (%d spans), dropping trace", traceMaxSize)
-		if tr != nil {
+	n := t.started.Add(1)
+	if n > int64(traceMaxSize) {
+		// Only log and signal on the first overflow.
+		if n == int64(traceMaxSize)+1 {
+			log.Error("trace buffer full (%d spans), dropping trace", traceMaxSize)
 			tracerstats.Signal(tracerstats.TracesDropped, 1)
 		}
+		t.dropped.Store(true)
 		return
 	}
+	tracerstats.Signal(tracerstats.SpanStarted, 1)
 	if v, ok := sp.metrics[keySamplingPriority]; ok {
-		t.setSamplingPriorityLocked(int(v), samplernames.Unknown)
-	}
-	t.spans = append(t.spans, sp)
-	if tr != nil {
-		tracerstats.Signal(tracerstats.SpanStarted, 1)
+		// Rare: explicit priority on a span — update trace metadata under mu.
+		t.setSamplingPriority(int(v), samplernames.Unknown)
 	}
 }
 
-// setTraceTagsLocked sets all "trace level" tags on the provided span
-// t must already be locked.
+// setTraceTagsLocked sets all "trace level" tags on the provided span.
+// Caller must hold t.mu for reading and s.mu for writing.
 // +checklocksread:t.mu
 // +checklocks:s.mu
 func (t *trace) setTraceTagsLocked(s *Span) {
@@ -734,139 +734,72 @@ func updateTracerGitMetadataTags(s *Span) {
 	}
 }
 
-// finishedOneLocked acknowledges that another span in the trace has finished, and checks
-// if the trace is complete, in which case it calls the onFinish function. It uses
-// the given priority, if non-nil, to mark the root span. This also will trigger a partial flush
-// if enabled and the total number of finished spans is greater than or equal to the partial flush limit.
+// finishedOneLocked is called when span s has finished. The caller holds s.mu.
 //
-// Lock ordering: span.mu -> trace.mu. The caller holds s.mu. This function acquires t.mu.
-// Invariant: The caller MUST hold s.mu.
-// +checklocksignore — Caller holds s.mu (cross-struct lock; checklocks can't verify through SpanContext.finish indirection).
+// In the send-on-finish model each span is submitted to the writer immediately
+// after it finishes; the trace.mu write lock is no longer on the hot path.
+// The only mu acquisitions here are:
+//   - RLock to read t.tags for setTraceTagsLocked (brief, allows concurrent readers)
+//   - Lock to set t.locked when the root span finishes (once per trace)
+//
+// Lock ordering: span.mu → trace.mu (same as before).
+// +checklocksignore — Caller holds s.mu; cross-struct ordering verified by convention.
 func (t *trace) finishedOneLocked(s *Span) {
 	assert.RWMutexLocked(&s.mu)
 
-	t.mu.Lock()
-	if t.full {
-		// capacity has been reached, the buffer is no longer tracking
-		// all the spans in the trace, so the below conditions will not
-		// be accurate and would trigger a pre-mature flush, exposing us
-		// to a race condition where spans can be modified while flushing.
-		//
-		// TODO(partialFlush): should we do a partial flush in this scenario?
-		t.mu.Unlock()
+	if t.dropped.Load() {
 		return
 	}
 	if s.finished {
-		t.mu.Unlock()
 		return
 	}
 	s.finished = true
-	t.finished++
 
 	tr := getGlobalTracer()
 	if tr == nil {
-		t.mu.Unlock()
+		t.finished.Add(1)
 		return
 	}
 	tc := tr.TracerConf()
-	setPeerService(s, tc)
 
-	// attach the _dd.base_service tag only when the globally configured service name is different from the
-	// span service name.
+	// Per-span metadata — s.mu already held by caller.
+	setPeerService(s, tc)
 	if s.service != "" && !strings.EqualFold(s.service, tc.ServiceTag) {
 		s.setMetaLocked(keyBaseService, tc.ServiceTag)
 	}
-	priority := t.priority.Load()
-	if s == t.root && priority != nil {
-		// after the root has finished we lock down the priority;
-		// we won't be able to make changes to a span after finishing
-		// without causing a race condition.
-		s.setMetricLocked(keySamplingPriority, *priority)
-		t.locked = true
-	}
-	if len(t.spans) > 0 && s == t.spans[0] {
-		// first span in chunk finished, lock down the tags
-		//
-		// TODO(barbayar): make sure this doesn't happen in vain when switching to
-		// the new wire format. We won't need to set the tags on the first span
-		// in the chunk there.
+
+	// Apply trace-level tags to the root span so the agent can find them.
+	// The root span is the canonical carrier of trace-level metadata.
+	if s == t.root {
+		priority := t.priority.Load()
+		if priority != nil {
+			s.setMetricLocked(keySamplingPriority, *priority)
+		}
+		t.mu.RLock()
 		t.setTraceTagsLocked(s)
+		t.mu.RUnlock()
+		// Lock the sampling priority after the root finishes so the DD sampler
+		// cannot override it via resampling.
+		t.mu.Lock()
+		t.locked = true
+		t.mu.Unlock()
 	}
 
-	// This is here to support the mocktracer. It would be nice to be able to not do this.
-	// We need to track when any single span is finished.
+	// Mocktracer hook — must run before the span is handed off to the writer.
 	if mtr, ok := tr.(interface{ FinishSpan(*Span) }); ok {
 		mtr.FinishSpan(s)
 	}
 
-	// Full flush: all spans finished
-	if len(t.spans) == t.finished {
-		spans := t.spans
-		willSend := decisionKeep == samplingDecision(atomic.LoadUint32((*uint32)(&t.samplingDecision)))
-		t.spans = nil
-		t.finished = 0 // important, because a buffer can be used for several flushes
-		t.mu.Unlock()
-		if tr, ok := tr.(*tracer); ok {
-			tr.submitChunk(&chunk{spans: spans, willSend: willSend})
-		}
-		return
-	}
-
-	doPartialFlush := tc.PartialFlush && t.finished >= tc.PartialFlushMinSpans
-	if !doPartialFlush {
-		t.mu.Unlock()
-		// The trace hasn't completed and partial flushing will not occur
-		return
-	}
-
-	// --- Partial flush path ---
-	log.Debug("Partial flush triggered with %d finished spans", t.finished)
-	telemetry.Count(telemetry.NamespaceTracers, "trace_partial_flush.count", []string{"reason:large_trace"}).Submit(1)
-
-	finishedSpans := make([]*Span, 0, t.finished)
-	leftoverSpans := make([]*Span, 0, len(t.spans)-t.finished)
-	for _, s2 := range t.spans {
-		if s2.finished {
-			finishedSpans = append(finishedSpans, s2)
-		} else {
-			leftoverSpans = append(leftoverSpans, s2)
-		}
-	}
-
-	telemetry.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_closed", nil).Submit(float64(len(finishedSpans)))
-	telemetry.Distribution(telemetry.NamespaceTracers, "trace_partial_flush.spans_remaining", nil).Submit(float64(len(leftoverSpans)))
-
-	// #incident-46344 -- if we set metrics and tags on a different span than what was passed into this function,
-	// we need to lock this new span. However, to preserve lock ordering (span.mu -> trace.mu), we must
-	// release trace.mu before acquiring fSpan.mu.
-	fSpan := finishedSpans[0]
-	currentSpanIsFirstInChunk := s == fSpan
-	needsFirstSpanTags := s != t.spans[0]
+	// Submit this span to the writer immediately (send-on-finish model).
+	// The writer batches spans and sends them to the agent.
 	willSend := decisionKeep == samplingDecision(atomic.LoadUint32((*uint32)(&t.samplingDecision)))
-
-	// Update trace state and release lock BEFORE acquiring fSpan lock
-	t.spans = leftoverSpans
-	t.finished = 0 // important, because a buffer can be used for several flushes
-	t.mu.Unlock()
-
-	// Set sampling priority and trace-level tags on first span in chunk
-	// If fSpan == s, lock is already held by caller; otherwise acquire it
-	if !currentSpanIsFirstInChunk {
-		fSpan.mu.Lock()
-		defer fSpan.mu.Unlock()
-	}
-	if priority != nil {
-		fSpan.setMetricLocked(keySamplingPriority, *priority)
-	}
-	if needsFirstSpanTags {
-		t.mu.RLock()
-		t.setTraceTagsLocked(fSpan)
-		t.mu.RUnlock()
+	if concreteTracer, ok := tr.(*tracer); ok {
+		concreteTracer.submitChunk(&chunk{spans: []*Span{s}, willSend: willSend, isRoot: s == t.root})
 	}
 
-	if tr, ok := tr.(*tracer); ok {
-		tr.submitChunk(&chunk{spans: finishedSpans, willSend: willSend})
-	}
+	// Atomic completion detection: when finished == started every span that
+	// was pushed has also been finished, so the trace is done.
+	t.finished.Add(1)
 }
 
 // setPeerService sets the peer.service, _dd.peer.service.source, and _dd.peer.service.remapped_from
